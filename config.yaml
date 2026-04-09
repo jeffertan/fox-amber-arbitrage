@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────
+# Amber 电价监控配置 — Brisbane
+# ─────────────────────────────────────────────
+
+# ─── 价格阈值 (AUD/kWh) ───
+thresholds:
+  sell_high: 0.50       # 卖出价 >= 此值时触发 Spike 提醒
+  sell_extreme: 1.00    # 极端高价提醒
+  negative_price: 0.0   # 买入价 <= 0 触发负电价提醒
+  alert_delta: 0.10     # 30分钟内价格变动 >= 此值触发大幅变动提醒
+
+# ─── 控制循环 ───
+control:
+  poll_interval_seconds: 900     # 每15分钟检查一次价格
+  amber_forecast_hours: 4        # 预测时长（status 命令用）
+
+# ─── 通知设置 ───
+notify:
+  enabled: true
+  on_spike_detected: true
+  on_negative_price: true
+  on_error: true
+  on_daily_summary: true
+  daily_summary_time: "21:30"
