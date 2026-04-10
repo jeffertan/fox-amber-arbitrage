@@ -11,10 +11,11 @@ Usage:
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 import yaml
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from amber_client import AmberClient
@@ -26,6 +27,34 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger(__name__)
+
+
+LOG_PATH = "monitor.log"
+
+
+def prune_log(path: str, keep_days: int = 14) -> None:
+    """Remove log lines older than keep_days days."""
+    if not os.path.exists(path):
+        return
+    cutoff = datetime.now() - timedelta(days=keep_days)
+    ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+    kept, removed = [], 0
+    with open(path) as f:
+        for line in f:
+            m = ts_re.match(line)
+            if m:
+                try:
+                    ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+                    if ts < cutoff:
+                        removed += 1
+                        continue
+                except ValueError:
+                    pass
+            kept.append(line)
+    with open(path, "w") as f:
+        f.writelines(kept)
+    if removed:
+        log.info(f"Log pruned: removed {removed} lines older than {keep_days} days")
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -55,8 +84,9 @@ def run(config: dict, dry_run: bool = False) -> None:
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
     amber_key = os.getenv("AMBER_API_KEY", "")
 
+    prune_log(LOG_PATH)
     amber = AmberClient(amber_key)
-    notifier = Notifier(config, bot_token=bot_token, chat_id=chat_id)
+    notifier = Notifier(config, bot_token=bot_token, chat_id=chat_id, log_path=LOG_PATH)
 
     t = config["thresholds"]
     ctrl = config["control"]
@@ -67,7 +97,7 @@ def run(config: dict, dry_run: bool = False) -> None:
     was_negative = False
     was_buy_high = False
     was_sell_notify = False
-    last_sell: float | None = None
+    last_sell = None  # float | None
     last_buy: float = 0.0
     last_daily_summary: str = ""
 
