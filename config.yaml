@@ -8,10 +8,12 @@ thresholds:
   sell_extreme: 1.00    # 极端高价提醒
   negative_price: 0.0   # 买入价 <= 0 触发负电价提醒
   alert_delta: 0.10     # 30分钟内价格变动 >= 此值触发大幅变动提醒
+  buy_high: 0.50        # 买入价 >= 此值提醒
+  sell_notify: 0.25     # 卖出价 >= 此值提醒
 
 # ─── 控制循环 ───
 control:
-  poll_interval_seconds: 900     # 每15分钟检查一次价格
+  poll_interval_seconds: 120     # 每2分钟检查一次价格
   amber_forecast_hours: 4        # 预测时长（status 命令用）
 
 # ─── 通知设置 ───

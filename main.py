@@ -65,6 +65,8 @@ def run(config: dict, dry_run: bool = False) -> None:
     # 状态追踪
     was_spike = False
     was_negative = False
+    was_buy_high = False
+    was_sell_notify = False
     last_sell: float | None = None
     last_buy: float = 0.0
     last_daily_summary: str = ""
@@ -107,10 +109,32 @@ def run(config: dict, dry_run: bool = False) -> None:
                     direction = "↑" if sell > last_sell else "↓"
                     notifier.price_alert(sell, buy, f"卖出价大幅变动 {direction} ${sell_delta:.4f}/kWh")
 
+                # ── 买入价偏高提醒 ────────────────────────────────────────
+                buy_high_threshold = t.get("buy_high")
+                if buy_high_threshold is not None:
+                    if buy >= buy_high_threshold and not was_buy_high:
+                        notifier.buy_high_alert(buy, buy_high_threshold)
+                    elif buy < buy_high_threshold and was_buy_high:
+                        notifier.buy_high_ended(buy)
+
+                # ── 卖出价偏高提醒 ────────────────────────────────────────
+                sell_notify_threshold = t.get("sell_notify")
+                if sell_notify_threshold is not None:
+                    if sell >= sell_notify_threshold and not was_sell_notify:
+                        notifier.sell_high_alert(sell, sell_notify_threshold)
+                    elif sell < sell_notify_threshold and was_sell_notify:
+                        notifier.sell_high_ended(sell)
+
             was_spike = is_spike
             was_negative = (buy <= t["negative_price"])
+            was_buy_high = (buy >= t.get("buy_high", float("inf")))
+            was_sell_notify = (sell >= t.get("sell_notify", float("inf")))
             last_sell = sell
             last_buy = buy
+
+            # ── 响应用户主动查询 ──────────────────────────────────────────
+            if not dry_run:
+                notifier.poll_and_reply(sell, buy, prices.sell.spike_status)
 
             # ── 每日总结 ──────────────────────────────────────────────────
             summary_time = config["notify"].get("daily_summary_time", "21:30")
