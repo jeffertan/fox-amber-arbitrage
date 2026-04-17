@@ -39,12 +39,14 @@ class CurrentPrices:
     sell: PricePoint
 
     def summary(self) -> str:
-        spike_tag = " [SPIKE]" if self.sell.is_spike else ""
-        neg_tag = " [NEGATIVE]" if self.buy.is_negative else ""
-        return (
-            f"Buy: ${self.buy.price_kwh:.4f}/kWh{neg_tag} | "
-            f"Sell: ${self.sell.price_kwh:.4f}/kWh{spike_tag}"
-        )
+        buy_tag = " [电网付钱]" if self.buy.is_negative else ""
+        # Amber feedIn sign convention: negative perKwh = user RECEIVES money; positive = user pays
+        if self.sell.price_kwh < 0:
+            spike_tag = " [SPIKE]" if self.sell.is_spike else ""
+            sell_str = f"卖出收入: ${abs(self.sell.price_kwh):.4f}/kWh{spike_tag}"
+        else:
+            sell_str = f"出口成本: ${self.sell.price_kwh:.4f}/kWh [出口需付费]"
+        return f"买入: ${self.buy.price_kwh:.4f}/kWh{buy_tag} | {sell_str}"
 
 
 class AmberClient:

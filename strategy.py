@@ -1,14 +1,27 @@
 """
-Arbitrage decision engine.
+Arbitrage decision engine — time-phase aware.
 
-Decision priority (highest → lowest):
-  1. Negative buy price       → Force charge (grid paying us to consume)
-  2. Extreme spike (>$1.00)   → Force discharge, ignore demand window
-  3. Spike / high sell price  → Force discharge (if SOC allows + demand window OK)
-  4. Low buy price            → Force charge from grid
-  5. Scheduled discharge window + price OK → Force discharge
-  6. Scheduled charge window  → Force charge (from solar, supplemented by grid if cheap)
-  7. Default                  → Self Use
+Two phases per day:
+
+  DAY (day_start – night_start, default 07:00–23:00)
+  ────────────────────────────────────────────────────
+  1. Negative buy price + before max_grid_charge_hour + SOC < 95%
+       → Force Charge  (grid paying us; stop before solar peak to leave room)
+  2. Extreme sell (≥ $1.00) + SOC > night_reserve
+       → Force Discharge  (no exceptions)
+  3. sell ≥ sell_threshold ($0.10) + SOC > night_reserve + profitable
+       → Force Discharge
+  4. Default → Self Use  (solar → home → battery; no grid draw forced)
+
+  NIGHT (night_start – day_start, default 23:00–07:00)
+  ──────────────────────────────────────────────────────
+  1. SOC ≤ night_reserve_soc (25%)
+       → Self Use  (protect floor; grid covers home load)
+  2. sell ≥ sell_threshold + SOC > night_reserve + 5% buffer
+       → Force Discharge  (fdSoc = night_reserve)
+  3. buy ≤ night_cheap_buy + SOC < night_target_soc
+       → Force Charge  (cheap top-up to reach morning reserve)
+  4. Default → Self Use
 """
 
 from dataclasses import dataclass
@@ -17,13 +30,17 @@ from typing import Optional
 import logging
 
 from amber_client import CurrentPrices
+from fox_client import InverterStatus
+from solar_forecast import SolarForecast
 
 log = logging.getLogger(__name__)
 
-# Actions returned by the strategy
 ACTION_FORCE_DISCHARGE = "force_discharge"
 ACTION_FORCE_CHARGE = "force_charge"
 ACTION_SELF_USE = "self_use"
+
+# Sell price above which we always discharge regardless of profit guard
+EXTREME_SPIKE = 1.00
 
 
 @dataclass
@@ -33,170 +50,171 @@ class Decision:
     sell_price: float
     buy_price: float
     soc: float
+    pv_kw: float = 0.0
     discharge_power_kw: Optional[float] = None
-    charge_power_kw: Optional[float] = None
-    target_soc: Optional[int] = None
 
     def __str__(self):
-        return f"[{self.action.upper()}] {self.reason} (SOC={self.soc:.0f}%, sell=${self.sell_price:.4f}, buy=${self.buy_price:.4f})"
+        return (
+            f"[{self.action.upper()}] {self.reason}"
+            f" (SOC={self.soc:.0f}%, solar={self.pv_kw:.2f}kW,"
+            f" sell=${self.sell_price:.4f}, buy=${self.buy_price:.4f})"
+        )
 
 
 class ArbitrageStrategy:
     def __init__(self, config: dict):
         self.cfg = config
-        self._avg_charge_cost: float = 0.10  # Running average cost of energy in battery
+        self._avg_charge_cost: float = 0.10
         self._charge_cost_samples: list[float] = []
 
-    def decide(self, prices: CurrentPrices, soc: float, forecast_prices: list = None) -> Decision:
+    def decide(
+        self,
+        prices: CurrentPrices,
+        inverter: InverterStatus,
+        solar: Optional[SolarForecast] = None,
+    ) -> Decision:
         t = self.cfg["thresholds"]
         b = self.cfg["battery"]
-        sys = self.cfg["system"]
+        sched = self.cfg["schedule"]
+        sys_cfg = self.cfg["system"]
 
         sell = prices.sell.price_kwh
         buy = prices.buy.price_kwh
-        is_spike = prices.sell.is_spike
+        soc = inverter.battery.soc
+        pv_kw = inverter.pv_power_kw
         now = datetime.now()
 
-        discharge_kw = min(b["max_discharge_kw"], sys["max_export_kw"])
-        charge_kw = b["max_charge_kw"]
+        discharge_kw = min(b["max_discharge_kw"], sys_cfg["max_export_kw"])
+        night_reserve = b["night_reserve_soc"]      # 25%
+        night_target = b["night_target_soc"]         # 30%
+        sell_threshold = t["sell_threshold"]          # $0.10
 
-        # Track charge cost for profit guard
         if buy > 0:
             self._update_avg_charge_cost(buy)
 
-        # ── 1. Negative buy price: grid paying us to consume ─────────────────
-        if buy <= t["negative_price"] and soc < b["max_soc"]:
-            return Decision(
-                action=ACTION_FORCE_CHARGE,
-                reason=f"Negative price ${buy:.4f}/kWh — charging from grid",
-                sell_price=sell, buy_price=buy, soc=soc,
-                charge_power_kw=charge_kw,
-                target_soc=b["max_soc"],
+        solar_tag = f" | solar={pv_kw:.2f}kW" if pv_kw > 0.05 else ""
+
+        if self._is_night(now, sched):
+            return self._decide_night(
+                sell, buy, soc, pv_kw, solar_tag,
+                sell_threshold, night_reserve, night_target, discharge_kw, t, b,
+            )
+        else:
+            return self._decide_day(
+                sell, buy, soc, pv_kw, solar_tag, now, sched,
+                sell_threshold, night_reserve, discharge_kw, t, b,
             )
 
-        # ── 2. Extreme spike: override all protections ────────────────────────
-        if sell >= t["sell_extreme"] and soc > b["min_soc"]:
-            return Decision(
-                action=ACTION_FORCE_DISCHARGE,
-                reason=f"Extreme spike ${sell:.4f}/kWh — full discharge",
-                sell_price=sell, buy_price=buy, soc=soc,
-                discharge_power_kw=discharge_kw,
-            )
+    # ── Phase handlers ────────────────────────────────────────────────────────
 
-        # ── 3. Spike / high sell price ─────────────────────────────────────────
-        if (is_spike or sell >= t["sell_high"]) and soc > b["min_soc"]:
-            if self._in_demand_window(now) and sell < t.get("override_price", 1.00):
-                return Decision(
-                    action=ACTION_SELF_USE,
-                    reason=f"Spike ${sell:.4f}/kWh but in demand window — holding",
-                    sell_price=sell, buy_price=buy, soc=soc,
-                )
-            if not self._is_profitable(sell):
-                return Decision(
-                    action=ACTION_SELF_USE,
-                    reason=f"Sell ${sell:.4f} < avg charge cost ${self._avg_charge_cost:.4f} + margin",
-                    sell_price=sell, buy_price=buy, soc=soc,
-                )
-            return Decision(
-                action=ACTION_FORCE_DISCHARGE,
-                reason=f"High sell price ${sell:.4f}/kWh (spike={is_spike})",
-                sell_price=sell, buy_price=buy, soc=soc,
-                discharge_power_kw=discharge_kw,
-            )
+    def _decide_day(
+        self, sell, buy, soc, pv_kw, solar_tag, now, sched,
+        sell_threshold, night_reserve, discharge_kw, t, b,
+    ) -> Decision:
+        charge_kw = b["max_charge_kw"]
 
-        # ── 4. Good sell price (above sell_min) ───────────────────────────────
-        if sell >= t["sell_min"] and soc > b["min_soc"]:
-            if self._in_demand_window(now):
-                log.debug("Price OK but in demand window — holding")
-                return Decision(
-                    action=ACTION_SELF_USE,
-                    reason=f"Sell ${sell:.4f}/kWh OK but demand window active",
-                    sell_price=sell, buy_price=buy, soc=soc,
-                )
-            if not self._is_profitable(sell):
-                return Decision(
-                    action=ACTION_SELF_USE,
-                    reason=f"Sell ${sell:.4f} not profitable vs charge cost ${self._avg_charge_cost:.4f}",
-                    sell_price=sell, buy_price=buy, soc=soc,
-                )
-            return Decision(
-                action=ACTION_FORCE_DISCHARGE,
-                reason=f"Sell price ${sell:.4f}/kWh above threshold",
-                sell_price=sell, buy_price=buy, soc=soc,
-                discharge_power_kw=discharge_kw,
-            )
-
-        # ── 5. Cheap grid power: charge from grid ─────────────────────────────
-        if buy <= t["buy_max"] and soc < b["max_soc"]:
-            return Decision(
-                action=ACTION_FORCE_CHARGE,
-                reason=f"Cheap grid ${buy:.4f}/kWh — charging",
-                sell_price=sell, buy_price=buy, soc=soc,
-                charge_power_kw=charge_kw,
-                target_soc=b["max_soc"],
-            )
-
-        # ── 6. Scheduled force charge window (solar top-up) ───────────────────
-        sched_charge = self.cfg["schedule"]["force_charge"]
+        # 1. Negative price: charge from grid — only before max_grid_charge_hour
         if (
-            sched_charge["enabled"]
-            and self._in_time_window(now, sched_charge["start"], sched_charge["end"])
-            and soc < sched_charge["target_soc"]
+            buy <= t["negative_price"]
+            and now.hour < sched["max_grid_charge_hour"]
+            and soc < b["max_soc"]
         ):
             return Decision(
                 action=ACTION_FORCE_CHARGE,
-                reason=f"Scheduled charge window — targeting SOC {sched_charge['target_soc']}%",
-                sell_price=sell, buy_price=buy, soc=soc,
-                charge_power_kw=charge_kw,
-                target_soc=sched_charge["target_soc"],
+                reason=f"Negative price ${buy:.4f}/kWh before {sched['max_grid_charge_hour']}:00{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
             )
 
-        # ── 7. Scheduled discharge window ─────────────────────────────────────
-        sched_dis = self.cfg["schedule"]["force_discharge"]
-        if (
-            sched_dis["enabled"]
-            and self._in_time_window(now, sched_dis["start"], sched_dis["end"])
-            and soc >= sched_dis["min_soc_start"]
-            and sell > 0.15  # Only discharge if we get something for it
-        ):
+        # 2. Extreme spike — discharge regardless of profit guard
+        # feedIn is negative when receiving money; <= -1.00 means receiving >= $1/kWh
+        if sell <= -EXTREME_SPIKE and soc > night_reserve:
             return Decision(
                 action=ACTION_FORCE_DISCHARGE,
-                reason=f"Scheduled discharge window, sell=${sell:.4f}/kWh",
-                sell_price=sell, buy_price=buy, soc=soc,
+                reason=f"Extreme spike receiving ${-sell:.4f}/kWh{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
                 discharge_power_kw=discharge_kw,
             )
 
-        # ── Default: Self Use ─────────────────────────────────────────────────
+        # 3. Profitable sell opportunity
+        # sell <= -threshold means receiving >= threshold per kWh
+        if sell <= -sell_threshold and soc > night_reserve:
+            if not self._is_profitable(sell, t):
+                return Decision(
+                    action=ACTION_SELF_USE,
+                    reason=(
+                        f"receive=${-sell:.4f} < cost ${self._avg_charge_cost:.4f}"
+                        f" + margin{solar_tag}"
+                    ),
+                    sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                )
+            return Decision(
+                action=ACTION_FORCE_DISCHARGE,
+                reason=f"receive=${-sell:.4f} ≥ threshold ${sell_threshold}{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                discharge_power_kw=discharge_kw,
+            )
+
+        # 4. Default — let solar + inverter self-optimise
         return Decision(
             action=ACTION_SELF_USE,
-            reason="No arbitrage opportunity — self use mode",
-            sell_price=sell, buy_price=buy, soc=soc,
+            reason=f"receive=${-sell:.4f} < threshold ${sell_threshold}{solar_tag}",
+            sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+        )
+
+    def _decide_night(
+        self, sell, buy, soc, pv_kw, solar_tag,
+        sell_threshold, night_reserve, night_target, discharge_kw, t, b,
+    ) -> Decision:
+        cheap_buy = t["night_cheap_buy"]
+
+        # 1. Below floor — stop all discharge, let grid cover home
+        if soc <= night_reserve:
+            return Decision(
+                action=ACTION_SELF_USE,
+                reason=f"SOC {soc:.0f}% ≤ night reserve {night_reserve}% — protecting floor{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+            )
+
+        # 2. Sell opportunity — discharge down to night_reserve floor
+        if sell <= -sell_threshold and soc > night_reserve + 5:
+            if self._is_profitable(sell, t):
+                return Decision(
+                    action=ACTION_FORCE_DISCHARGE,
+                    reason=f"Night sell receiving ${-sell:.4f}/kWh, SOC {soc:.0f}%{solar_tag}",
+                    sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                    discharge_power_kw=discharge_kw,
+                )
+
+        # 3. Cheap top-up to ensure morning reserve
+        if buy <= cheap_buy and soc < night_target:
+            return Decision(
+                action=ACTION_FORCE_CHARGE,
+                reason=f"Night cheap charge ${buy:.4f}/kWh → target {night_target}%{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+            )
+
+        # 4. Default
+        return Decision(
+            action=ACTION_SELF_USE,
+            reason=f"Night hold — SOC {soc:.0f}%{solar_tag}",
+            sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _is_profitable(self, sell_price: float) -> bool:
-        margin = self.cfg["thresholds"].get("min_profit_margin", 0.05)
-        return sell_price >= (self._avg_charge_cost + margin)
+    def _is_night(self, now: datetime, sched: dict) -> bool:
+        night_start = time.fromisoformat(sched["night_start"])
+        day_start = time.fromisoformat(sched["day_start"])
+        t = now.time()
+        return t >= night_start or t < day_start
+
+    def _is_profitable(self, sell_price: float, t: dict) -> bool:
+        margin = t.get("min_profit_margin", 0.05)
+        # sell_price is negative (feedIn convention); -sell_price = amount received
+        return -sell_price >= self._avg_charge_cost + margin
 
     def _update_avg_charge_cost(self, buy_price: float, window: int = 20) -> None:
-        """Rolling average of recent buy prices (proxy for battery charge cost)."""
         self._charge_cost_samples.append(buy_price)
         if len(self._charge_cost_samples) > window:
             self._charge_cost_samples.pop(0)
         self._avg_charge_cost = sum(self._charge_cost_samples) / len(self._charge_cost_samples)
-
-    def _in_time_window(self, now: datetime, start_str: str, end_str: str) -> bool:
-        start = time.fromisoformat(start_str)
-        end = time.fromisoformat(end_str)
-        return start <= now.time() <= end
-
-    def _in_demand_window(self, now: datetime) -> bool:
-        dw = self.cfg.get("demand_window", {})
-        if not dw.get("enabled"):
-            return False
-        month = now.month
-        peak_months = dw.get("summer_months", []) + dw.get("winter_months", [])
-        if month not in peak_months:
-            return False
-        return self._in_time_window(now, dw["peak_start"], dw["peak_end"])

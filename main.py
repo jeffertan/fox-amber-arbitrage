@@ -1,11 +1,10 @@
 """
-Amber Electric Price Monitor
-发现价格异动时发送 Telegram 通知
+Amber + Fox ESS 电价套利监控
 
 Usage:
-  python main.py           # 开始监控
-  python main.py --dry-run # 只打印，不发通知
-  python main.py --status  # 打印当前价格并退出
+  python main.py              # 启动套利（arbitrage.enabled=true 时控制逆变器）
+  python main.py --dry-run    # 只打印决策，不发通知也不控制逆变器
+  python main.py --status     # 打印当前价格 + 电池状态并退出
 """
 
 import argparse
@@ -19,8 +18,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 from amber_client import AmberClient
+from strategy import ACTION_FORCE_DISCHARGE, ACTION_FORCE_CHARGE, ACTION_SELF_USE
 
-# ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -28,12 +27,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
 LOG_PATH = "monitor.log"
 
 
 def prune_log(path: str, keep_days: int = 14) -> None:
-    """Remove log lines older than keep_days days."""
     if not os.path.exists(path):
         return
     cutoff = datetime.now() - timedelta(days=keep_days)
@@ -54,7 +51,7 @@ def prune_log(path: str, keep_days: int = 14) -> None:
     with open(path, "w") as f:
         f.writelines(kept)
     if removed:
-        log.info(f"Log pruned: removed {removed} lines older than {keep_days} days")
+        log.info(f"Log pruned: {removed} lines older than {keep_days} days removed")
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -62,7 +59,7 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def status_report(amber: AmberClient) -> None:
+def status_report(amber: AmberClient, fox=None) -> None:
     print("\n─── Amber 当前价格 ────────────────────────────────")
     prices = amber.get_current_prices()
     print(f"  {prices.summary()}")
@@ -74,7 +71,32 @@ def status_report(amber: AmberClient) -> None:
         t = p.start_time.strftime("%H:%M")
         spike = " ← SPIKE" if p.is_spike else ""
         print(f"  {t}  ${p.price_kwh:.4f}/kWh{spike}")
+
+    if fox:
+        print("\n─── Fox 逆变器状态 ───────────────────────────────")
+        try:
+            status = fox.get_real_power()
+            print(f"  工作模式: {status.work_mode}")
+            print(f"  电池 SOC: {status.battery.soc:.0f}%")
+            print(f"  太阳能: {status.pv_power_kw:.2f} kW")
+            print(f"  电网: {status.grid_power_kw:+.2f} kW  (正=进口, 负=出口)")
+            print(f"  家庭负载: {status.load_power_kw:.2f} kW")
+        except Exception as e:
+            print(f"  无法获取逆变器状态: {e}")
     print()
+
+
+def _apply_decision(fox, decision, config: dict, dry_run: bool) -> None:
+    if dry_run:
+        log.info(f"[DRY RUN] {decision}")
+        return
+    night_reserve = config["battery"]["night_reserve_soc"]
+    if decision.action == ACTION_FORCE_DISCHARGE:
+        fox.force_discharge(decision.discharge_power_kw, min_soc=night_reserve)
+    elif decision.action == ACTION_FORCE_CHARGE:
+        fox.force_charge()
+    else:
+        fox.self_use()
 
 
 def run(config: dict, dry_run: bool = False) -> None:
@@ -88,24 +110,44 @@ def run(config: dict, dry_run: bool = False) -> None:
     amber = AmberClient(amber_key)
     notifier = Notifier(config, bot_token=bot_token, chat_id=chat_id, log_path=LOG_PATH)
 
+    # ── 初始化套利组件 ──────────────────────────────────────────────────────────
+    fox = None
+    strategy = None
+    solar_client = None
+    if config.get("arbitrage", {}).get("enabled"):
+        fox_key = os.getenv("FOX_API_KEY", "")
+        fox_sn = os.getenv("FOX_DEVICE_SN", "")
+        if fox_key:
+            from fox_client import FoxClient
+            from strategy import ArbitrageStrategy
+            fox = FoxClient(fox_key, fox_sn)
+            strategy = ArbitrageStrategy(config)
+            log.info("套利策略已启用 — 将通过 Fox API 控制逆变器")
+        else:
+            log.warning("arbitrage.enabled=true 但 FOX_API_KEY 未设置，套利已跳过")
+
+    if config.get("solar", {}).get("enabled"):
+        from solar_forecast import SolarForecastClient
+        solar_client = SolarForecastClient(config)
+        log.info("太阳能预测已启用 (Open-Meteo)")
+
     t = config["thresholds"]
     ctrl = config["control"]
     poll_sec = ctrl["poll_interval_seconds"]
 
-    # 状态追踪
     was_spike = False
     was_negative = False
     was_buy_high = False
     was_sell_notify = False
-    last_sell = None  # float | None
-    last_buy: float = 0.0
+    last_sell = None
+    last_action = None
     last_daily_summary: str = ""
 
-    mode_str = "DRY RUN" if dry_run else "LIVE"
+    mode_str = "DRY RUN" if dry_run else ("LIVE + 套利" if fox else "仅监控")
     log.info(f"{'='*55}")
-    log.info(f"  Amber 价格监控 — {mode_str}")
-    log.info(f"  Spike阈值: ${t['sell_high']:.2f} | 极端Spike: ${t['sell_extreme']:.2f}")
-    log.info(f"  负电价阈值: ${t['negative_price']:.2f} | 轮询间隔: {poll_sec}s")
+    log.info(f"  Amber 电价套利监控 — {mode_str}")
+    log.info(f"  卖电阈值: ${t['sell_threshold']:.2f} | 负电价截止: {config['schedule']['max_grid_charge_hour']}:00")
+    log.info(f"  夜间底线: {config['battery']['night_reserve_soc']}% SOC | 轮询间隔: {poll_sec}s")
     log.info(f"{'='*55}")
 
     while True:
@@ -118,6 +160,30 @@ def run(config: dict, dry_run: bool = False) -> None:
 
             log.info(prices.summary())
 
+            # ── 套利决策 ──────────────────────────────────────────────────────
+            if fox and strategy:
+                try:
+                    inverter = fox.get_real_power()
+                    solar = solar_client.get_tomorrow() if solar_client else None
+                    if solar:
+                        log.info(f"太阳能预测: {solar.summary()}")
+                    log.info(
+                        f"逆变器: SOC={inverter.battery.soc:.0f}%"
+                        f" solar={inverter.pv_power_kw:.2f}kW"
+                        f" grid={inverter.grid_power_kw:+.2f}kW"
+                        f" load={inverter.load_power_kw:.2f}kW"
+                    )
+                    decision = strategy.decide(prices, inverter, solar)
+                    log.info(f"决策: {decision}")
+
+                    if decision.action != last_action:
+                        _apply_decision(fox, decision, config, dry_run)
+                        if not dry_run:
+                            notifier.mode_change(decision)
+                        last_action = decision.action
+                except Exception as e:
+                    log.error(f"套利执行错误: {e}", exc_info=True)
+
             if not dry_run:
                 # ── Spike 检测 ────────────────────────────────────────────
                 if is_spike and not was_spike:
@@ -129,44 +195,41 @@ def run(config: dict, dry_run: bool = False) -> None:
                 if buy <= t["negative_price"] and not was_negative:
                     notifier.negative_price(buy)
 
-                # ── 极端高价提醒（即使 spike_status 未标记）────────────────
-                if sell >= t["sell_extreme"] and not is_spike:
-                    notifier.price_alert(sell, buy, f"极端高卖出价 ${sell:.4f}/kWh")
+                # ── 极端高卖出收入（spike_status 未标记时兜底）───────────
+                if sell <= -1.00 and not is_spike:
+                    notifier.price_alert(sell, buy, f"极端高卖出收入 ${-sell:.4f}/kWh")
 
-                # ── 大幅价格变动提醒 ──────────────────────────────────────
+                # ── 大幅价格变动 ──────────────────────────────────────────
                 sell_delta = abs(sell - last_sell) if last_sell is not None else 0.0
                 if last_sell is not None and sell_delta >= t.get("alert_delta", 0.10):
                     direction = "↑" if sell > last_sell else "↓"
                     notifier.price_alert(sell, buy, f"卖出价大幅变动 {direction} ${sell_delta:.4f}/kWh")
 
                 # ── 买入价偏高提醒 ────────────────────────────────────────
-                buy_high_threshold = t.get("buy_high")
-                if buy_high_threshold is not None:
-                    if buy >= buy_high_threshold and not was_buy_high:
-                        notifier.buy_high_alert(buy, buy_high_threshold)
-                    elif buy < buy_high_threshold and was_buy_high:
+                buy_high = t.get("buy_high")
+                if buy_high is not None:
+                    if buy >= buy_high and not was_buy_high:
+                        notifier.buy_high_alert(buy, buy_high)
+                    elif buy < buy_high and was_buy_high:
                         notifier.buy_high_ended(buy)
 
                 # ── 卖出价偏高提醒 ────────────────────────────────────────
-                sell_notify_threshold = t.get("sell_notify")
-                if sell_notify_threshold is not None:
-                    if sell >= sell_notify_threshold and not was_sell_notify:
-                        notifier.sell_high_alert(sell, sell_notify_threshold)
-                    elif sell < sell_notify_threshold and was_sell_notify:
+                sell_notify = t.get("sell_notify")
+                if sell_notify is not None:
+                    if sell <= -sell_notify and not was_sell_notify:
+                        notifier.sell_high_alert(sell, sell_notify)
+                    elif sell > -sell_notify and was_sell_notify:
                         notifier.sell_high_ended(sell)
 
             was_spike = is_spike
             was_negative = (buy <= t["negative_price"])
             was_buy_high = (buy >= t.get("buy_high", float("inf")))
-            was_sell_notify = (sell >= t.get("sell_notify", float("inf")))
+            was_sell_notify = (sell <= -t.get("sell_notify", float("inf")))
             last_sell = sell
-            last_buy = buy
 
-            # ── 响应用户主动查询 ──────────────────────────────────────────
             if not dry_run:
                 notifier.poll_and_reply(sell, buy, prices.sell.spike_status)
 
-            # ── 每日总结 ──────────────────────────────────────────────────
             summary_time = config["notify"].get("daily_summary_time", "21:30")
             now_hm = datetime.now().strftime("%H:%M")
             if now_hm == summary_time and now_hm != last_daily_summary:
@@ -176,7 +239,14 @@ def run(config: dict, dry_run: bool = False) -> None:
 
         except KeyboardInterrupt:
             log.info("监控停止")
+            if fox and last_action != ACTION_SELF_USE and not dry_run:
+                log.info("恢复逆变器至 Self Use 模式")
+                try:
+                    fox.self_use()
+                except Exception:
+                    pass
             break
+
         except Exception as e:
             log.error(f"错误: {e}", exc_info=True)
             if not dry_run:
@@ -187,9 +257,9 @@ def run(config: dict, dry_run: bool = False) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Amber 电价监控 + Telegram 通知")
-    parser.add_argument("--dry-run", action="store_true", help="只打印日志，不发通知")
-    parser.add_argument("--status", action="store_true", help="打印当前价格并退出")
+    parser = argparse.ArgumentParser(description="Amber 电价套利监控")
+    parser.add_argument("--dry-run", action="store_true", help="只打印决策，不控制逆变器也不发通知")
+    parser.add_argument("--status", action="store_true", help="打印当前状态并退出")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     args = parser.parse_args()
 
@@ -197,7 +267,13 @@ def main():
     config = load_config(args.config)
 
     if args.status:
-        status_report(AmberClient(os.getenv("AMBER_API_KEY", "")))
+        fox = None
+        if config.get("arbitrage", {}).get("enabled"):
+            fox_key = os.getenv("FOX_API_KEY", "")
+            if fox_key:
+                from fox_client import FoxClient
+                fox = FoxClient(fox_key, os.getenv("FOX_DEVICE_SN", ""))
+        status_report(AmberClient(os.getenv("AMBER_API_KEY", "")), fox)
         return
 
     run(config, dry_run=args.dry_run)

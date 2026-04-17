@@ -28,10 +28,12 @@ class Notifier:
 
     @staticmethod
     def _fmt_sell(sell_price: float) -> str:
-        """Display sell price from user's perspective (positive = money received)."""
+        # Amber feedIn sign convention:
+        #   negative = you RECEIVE money for exports (good, discharge!)
+        #   positive = you PAY to export (grid oversupply, do NOT export)
         if sell_price < 0:
-            return f"太阳能卖出 `${abs(sell_price):.4f}/kWh`"
-        return f"卖出 `${sell_price:.4f}/kWh`"
+            return f"卖出收入 `${abs(sell_price):.4f}/kWh`"
+        return f"出口成本 `${sell_price:.4f}/kWh` ⚠️ 出口需付费"
 
     def spike_detected(self, sell_price: float):
         if not self.cfg.get("on_spike_detected"):
@@ -175,6 +177,23 @@ class Notifier:
                 )
                 self._send_to(msg, reply_chat_id)
                 log.info(f"Replied to message from chat_id={reply_chat_id}")
+
+    def mode_change(self, decision) -> None:
+        if not self.cfg.get("on_mode_change"):
+            return
+        icons = {
+            "force_charge": "🔋",
+            "force_discharge": "⚡️",
+            "self_use": "🌞",
+        }
+        icon = icons.get(decision.action, "📟")
+        msg = (
+            f"{icon} *逆变器模式切换*\n"
+            f"模式: `{decision.action}`\n"
+            f"原因: {decision.reason}\n"
+            f"SOC: `{decision.soc:.0f}%` | 买入: `${decision.buy_price:.4f}` | 卖出: `${decision.sell_price:.4f}/kWh`"
+        )
+        self._send(msg)
 
     def error(self, error_msg: str):
         if not self.cfg.get("on_error"):
