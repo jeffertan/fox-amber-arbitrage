@@ -188,12 +188,12 @@ class FoxClient:
             min_soc_on_grid=min_soc,
         )
 
-    def force_charge(self, min_soc: int = 10) -> None:
-        """Force charge from grid. Inverter controls charge rate internally."""
+    def force_charge(self, target_soc: int = 95) -> None:
+        """Force charge from grid up to target_soc %. Inverter controls charge rate."""
         self._set_scheduler(
             MODE_FORCE_CHARGE,
-            fd_soc=min_soc,
-            min_soc_on_grid=min_soc,
+            fd_soc=target_soc,
+            min_soc_on_grid=10,
         )
 
     def self_use(self) -> None:

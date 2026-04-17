@@ -99,7 +99,7 @@ def _apply_decision(fox, decision, config: dict, dry_run: bool) -> None:
         fox.self_use()
 
 
-def run(config: dict, dry_run: bool = False) -> None:
+def run(config: dict, dry_run: bool = False, state=None, config_path: str = "config.yaml") -> None:
     from notifier import Notifier
 
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -131,10 +131,6 @@ def run(config: dict, dry_run: bool = False) -> None:
         solar_client = SolarForecastClient(config)
         log.info("太阳能预测已启用 (Open-Meteo)")
 
-    t = config["thresholds"]
-    ctrl = config["control"]
-    poll_sec = ctrl["poll_interval_seconds"]
-
     was_spike = False
     was_negative = False
     was_buy_high = False
@@ -142,16 +138,26 @@ def run(config: dict, dry_run: bool = False) -> None:
     last_sell = None
     last_action = None
     last_daily_summary: str = ""
+    last_action_start: datetime | None = None
+    last_action_price_kwh: float = 0.0
+    last_action_grid_kw: float = 0.0
 
     mode_str = "DRY RUN" if dry_run else ("LIVE + 套利" if fox else "仅监控")
     log.info(f"{'='*55}")
     log.info(f"  Amber 电价套利监控 — {mode_str}")
-    log.info(f"  卖电阈值: ${t['sell_threshold']:.2f} | 负电价截止: {config['schedule']['max_grid_charge_hour']}:00")
-    log.info(f"  夜间底线: {config['battery']['night_reserve_soc']}% SOC | 轮询间隔: {poll_sec}s")
     log.info(f"{'='*55}")
 
     while True:
         loop_start = time.monotonic()
+        # ── 热重载配置 ────────────────────────────────────────────────────────
+        try:
+            config = load_config(config_path)
+        except Exception:
+            pass  # keep using last good config on parse error
+        t = config["thresholds"]
+        poll_sec = config["control"]["poll_interval_seconds"]
+        if strategy:
+            strategy.cfg = config  # propagate updated thresholds to strategy
         try:
             prices = amber.get_current_prices()
             sell = prices.sell.price_kwh
@@ -159,6 +165,8 @@ def run(config: dict, dry_run: bool = False) -> None:
             is_spike = prices.sell.is_spike
 
             log.info(prices.summary())
+            if state:
+                state.update_prices(buy, sell, prices.sell.spike_status)
 
             # ── 套利决策 ──────────────────────────────────────────────────────
             if fox and strategy:
@@ -173,14 +181,25 @@ def run(config: dict, dry_run: bool = False) -> None:
                         f" grid={inverter.grid_power_kw:+.2f}kW"
                         f" load={inverter.load_power_kw:.2f}kW"
                     )
+                    if state:
+                        state.update_inverter(inverter)
                     decision = strategy.decide(prices, inverter, solar)
                     log.info(f"决策: {decision}")
+                    if state:
+                        state.update_decision(decision.action, decision.reason, strategy._avg_charge_cost)
 
-                    if decision.action != last_action:
+                    if decision.action != last_action and not (state and state.is_manual_override()):
+                        # Record trade for the action we're leaving
+                        if state and last_action in (ACTION_FORCE_DISCHARGE, ACTION_FORCE_CHARGE) and last_action_start:
+                            duration_sec = (datetime.now() - last_action_start).total_seconds()
+                            state.record_trade(last_action, last_action_price_kwh, last_action_grid_kw, duration_sec)
                         _apply_decision(fox, decision, config, dry_run)
                         if not dry_run:
                             notifier.mode_change(decision)
                         last_action = decision.action
+                        last_action_start = datetime.now()
+                        last_action_price_kwh = sell if decision.action == ACTION_FORCE_DISCHARGE else buy
+                        last_action_grid_kw = inverter.grid_power_kw
                 except Exception as e:
                     log.error(f"套利执行错误: {e}", exc_info=True)
 

@@ -1,55 +1,37 @@
-# ─────────────────────────────────────────────
-# Amber + Fox ESS 电价套利配置 — Brisbane / QLD
-# ─────────────────────────────────────────────
-
-# ─── 套利开关 ───
 arbitrage:
   enabled: true
-
-# ─── 价格阈值 (AUD/kWh) ───
 thresholds:
-  sell_threshold: 0.10      # 卖出价 >= 此值时放电套利
-  negative_price: 0.0       # 买入价 <= 0 触发负电价充电
-  min_profit_margin: 0.05   # 卖出价必须超出平均充电成本 + 此边际
-  night_cheap_buy: 0.08     # 夜间买入价 <= 此值时补充充电
-  alert_delta: 0.10         # 价格变动提醒阈值
-  buy_high: 0.50            # 买入价偏高提醒
-  sell_notify: 0.25         # 卖出价偏高提醒
-
-# ─── 电池参数 ───
+  sell_threshold: 0.1
+  negative_price: 0.0
+  min_profit_margin: 0.05
+  night_cheap_buy: 0.08
+  alert_delta: 0.1
+  buy_high: 0.5
+  sell_notify: -0.8
 battery:
-  min_soc: 15               # 硬件保护底线（%）
-  max_soc: 95               # 充电上限（%）
+  min_soc: 15
+  max_soc: 95
   max_charge_kw: 5.0
   max_discharge_kw: 5.0
-  capacity_kwh: 37.7        # 可用容量：41.9 kWh × 90%
-  night_reserve_soc: 25     # 夜间 SOC 底线，低于此值停止放电（%）
-  night_target_soc: 30      # 夜间便宜充电目标（%）
-
-# ─── 系统参数 ───
+  capacity_kwh: 37.7
+  night_reserve_soc: 25
+  night_target_soc: 30
 system:
-  max_export_kw: 5.0        # QLD 电网出口限制
-
-# ─── 时段配置 ───
+  max_export_kw: 5.0
 schedule:
-  day_start: "07:00"        # 白天模式开始（可放电，禁电网充）
-  night_start: "23:00"      # 夜间模式开始（保 SOC 底线）
-  max_grid_charge_hour: 14  # 电网充电截止时间（小时，24h）：14=下午2点
-
-# ─── 太阳能预测（Open-Meteo，免费无需注册）───
+  day_start: 07:00
+  night_start: '23:00'
+  max_grid_charge_hour: 14
 solar:
   enabled: true
   latitude: -27.4698
   longitude: 153.0251
   peak_daily_kwh: 25.0
   clear_sky_ghi_kwh_m2: 5.5
-
-# ─── 控制循环 ───
 control:
   poll_interval_seconds: 120
   amber_forecast_hours: 4
-
-# ─── 通知设置 ───
+  manual_override_minutes: 60
 notify:
   enabled: true
   on_spike_detected: true
@@ -57,4 +39,4 @@ notify:
   on_mode_change: true
   on_error: true
   on_daily_summary: true
-  daily_summary_time: "21:30"
+  daily_summary_time: '21:30'
