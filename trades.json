@@ -1,0 +1,11 @@
+[
+  {
+    "timestamp": "2026-04-20T14:06:29.667433",
+    "action": "force_charge",
+    "price_kwh": 0.037461,
+    "grid_kw": 7.938,
+    "duration_sec": 953.145292,
+    "est_kwh": 2.10168536886,
+    "est_revenue": -0.07873123560286446
+  }
+]
