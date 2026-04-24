@@ -201,6 +201,11 @@ class Notifier:
         msg = f"❌ *系统错误*\n`{error_msg}`"
         self._send(msg)
 
+    def recovered(self):
+        if not self.cfg.get("on_error"):
+            return
+        self._send("✅ *连接已恢复*，监控继续运行")
+
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _delete_webhook(self):

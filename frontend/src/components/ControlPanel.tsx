@@ -3,6 +3,8 @@ import { api } from '../api'
 
 interface Props {
   currentSoc?: number
+  currentAction?: string   // actual mode: force_charge | force_discharge | self_use
+  isOverride?: boolean
   onAction?: () => void
 }
 
@@ -28,7 +30,13 @@ function SocSlider({ value, onChange, min, max, label, color }: {
   )
 }
 
-export default function ControlPanel({ currentSoc, onAction }: Props) {
+const MODE_STYLES: Record<string, { bg: string; text: string; label: string; icon: string }> = {
+  force_charge:    { bg: 'bg-blue-950',   text: 'text-blue-400',   label: '强制充电中', icon: '🔋' },
+  force_discharge: { bg: 'bg-orange-950', text: 'text-orange-400', label: '强制放电中', icon: '⚡' },
+  self_use:        { bg: 'bg-green-950',  text: 'text-green-400',  label: '自用模式',   icon: '🌞' },
+}
+
+export default function ControlPanel({ currentSoc, currentAction, isOverride, onAction }: Props) {
   const [chargeTarget, setChargeTarget] = useState(95)
   const [dischargeFloor, setDischargeFloor] = useState(25)
   const [busy, setBusy] = useState<string | null>(null)
@@ -62,13 +70,30 @@ export default function ControlPanel({ currentSoc, onAction }: Props) {
   const chargeBlocked = currentSoc !== undefined && currentSoc >= chargeTarget
   const dischargeBlocked = currentSoc !== undefined && currentSoc <= dischargeFloor
 
+  const modeStyle = currentAction ? (MODE_STYLES[currentAction] ?? MODE_STYLES.self_use) : null
+
   return (
     <div className="space-y-4">
       <h3 className="text-gray-300 text-sm font-medium">手动控制逆变器</h3>
 
-      {currentSoc !== undefined && (
-        <div className="text-xs text-gray-500">
-          当前 SOC: <span className="text-gray-300 font-mono font-bold">{currentSoc.toFixed(0)}%</span>
+      {/* Real-time mode indicator */}
+      {modeStyle && (
+        <div className={`flex items-center justify-between rounded-xl px-3 py-2.5 ${modeStyle.bg}`}>
+          <div className="flex items-center gap-2">
+            <span className="text-lg">{modeStyle.icon}</span>
+            <div>
+              <div className={`text-sm font-semibold ${modeStyle.text}`}>{modeStyle.label}</div>
+              {isOverride && (
+                <div className="text-xs text-yellow-500">🔒 手动覆盖中</div>
+              )}
+            </div>
+          </div>
+          {currentSoc !== undefined && (
+            <div className="text-right">
+              <div className="text-xs text-gray-500">SOC</div>
+              <div className="text-gray-200 font-mono font-bold">{currentSoc.toFixed(0)}%</div>
+            </div>
+          )}
         </div>
       )}
 

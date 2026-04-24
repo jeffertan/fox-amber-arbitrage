@@ -5,23 +5,29 @@ thresholds:
   negative_price: 0.0
   min_profit_margin: 0.05
   night_cheap_buy: 0.08
+  day_cheap_buy: 0.05
   alert_delta: 0.1
   buy_high: 0.5
   sell_notify: -0.8
 battery:
   min_soc: 15
   max_soc: 95
-  max_charge_kw: 5.0
-  max_discharge_kw: 5.0
+  max_charge_kw: 8
+  max_discharge_kw: 10
   capacity_kwh: 37.7
   night_reserve_soc: 25
+  day_discharge_reserve_soc: 45
   night_target_soc: 30
+  solar_saturation_threshold: 0.8
+  aggressive_charge_soc: 80
+  aggressive_charge_target: 90
 system:
   max_export_kw: 5.0
 schedule:
   day_start: 07:00
   night_start: '23:00'
   max_grid_charge_hour: 14
+  sunset_hour: 19
 solar:
   enabled: true
   latitude: -27.4698

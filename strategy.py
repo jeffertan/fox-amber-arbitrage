@@ -52,6 +52,7 @@ class Decision:
     soc: float
     pv_kw: float = 0.0
     discharge_power_kw: Optional[float] = None
+    charge_target_soc: Optional[int] = None
 
     def __str__(self):
         return (
@@ -85,33 +86,38 @@ class ArbitrageStrategy:
         now = datetime.now()
 
         discharge_kw = min(b["max_discharge_kw"], sys_cfg["max_export_kw"])
-        night_reserve = b["night_reserve_soc"]      # 25%
-        night_target = b["night_target_soc"]         # 30%
-        sell_threshold = t["sell_threshold"]          # $0.10
-
-        if buy > 0:
-            self._update_avg_charge_cost(buy)
+        night_reserve = b["night_reserve_soc"]           # 25%
+        day_reserve = b.get("day_discharge_reserve_soc", 45)  # 45%
+        sell_threshold = t["sell_threshold"]              # $0.10
 
         solar_tag = f" | solar={pv_kw:.2f}kW" if pv_kw > 0.05 else ""
 
         if self._is_night(now, sched):
-            return self._decide_night(
+            decision = self._decide_night(
                 sell, buy, soc, pv_kw, solar_tag,
-                sell_threshold, night_reserve, night_target, discharge_kw, t, b,
+                sell_threshold, night_reserve, discharge_kw, t, b, solar,
             )
         else:
-            return self._decide_day(
+            decision = self._decide_day(
                 sell, buy, soc, pv_kw, solar_tag, now, sched,
-                sell_threshold, night_reserve, discharge_kw, t, b,
+                sell_threshold, day_reserve, discharge_kw, t, b, solar,
             )
+
+        if decision.action == ACTION_FORCE_CHARGE and buy > 0:
+            self._update_avg_charge_cost(buy)
+
+        return decision
 
     # ── Phase handlers ────────────────────────────────────────────────────────
 
     def _decide_day(
         self, sell, buy, soc, pv_kw, solar_tag, now, sched,
         sell_threshold, night_reserve, discharge_kw, t, b,
+        solar: Optional[SolarForecast] = None,
     ) -> Decision:
-        charge_kw = b["max_charge_kw"]
+
+        aggressive_soc = b.get("aggressive_charge_soc", 80)  # below this, always charge on negative price
+        charge_to_soc = b.get("aggressive_charge_target", 90)   # target when charging aggressively
 
         # 1. Negative price: charge from grid — only before max_grid_charge_hour
         if (
@@ -119,10 +125,43 @@ class ArbitrageStrategy:
             and now.hour < sched["max_grid_charge_hour"]
             and soc < b["max_soc"]
         ):
+            # SOC below threshold: always charge aggressively regardless of solar
+            if soc < aggressive_soc:
+                return Decision(
+                    action=ACTION_FORCE_CHARGE,
+                    reason=f"Negative price ${buy:.4f}/kWh, SOC={soc:.0f}% < {aggressive_soc}% — full charge to {charge_to_soc}%{solar_tag}",
+                    sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                    charge_target_soc=charge_to_soc,
+                )
+            # SOC >= threshold: skip if solar will fill the battery
+            if self._solar_will_saturate(soc, pv_kw, sched, b):
+                return Decision(
+                    action=ACTION_SELF_USE,
+                    reason=f"Solar will saturate battery (SOC={soc:.0f}%, PV={pv_kw:.2f}kW) — skip negative-price charge",
+                    sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                )
+            target = self._charge_target_soc(solar, b)
             return Decision(
                 action=ACTION_FORCE_CHARGE,
-                reason=f"Negative price ${buy:.4f}/kWh before {sched['max_grid_charge_hour']}:00{solar_tag}",
+                reason=f"Negative price ${buy:.4f}/kWh before {sched['max_grid_charge_hour']}:00, target SOC={target}%{solar_tag}",
                 sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                charge_target_soc=target,
+            )
+
+        # 1b. Cheap daytime price — charge unless battery is nearly full and solar will top it off
+        day_cheap = t.get("day_cheap_buy", 0.05)
+        solar_will_fill = soc >= aggressive_soc and self._solar_will_saturate(soc, pv_kw, sched, b)
+        if (
+            buy <= day_cheap
+            and now.hour < sched["max_grid_charge_hour"]
+            and soc < b["max_soc"]
+            and not solar_will_fill
+        ):
+            return Decision(
+                action=ACTION_FORCE_CHARGE,
+                reason=f"Cheap daytime price ${buy:.4f}/kWh ≤ ${day_cheap}, target SOC={charge_to_soc}%{solar_tag}",
+                sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
+                charge_target_soc=charge_to_soc,
             )
 
         # 2. Extreme spike — discharge regardless of profit guard
@@ -163,9 +202,12 @@ class ArbitrageStrategy:
 
     def _decide_night(
         self, sell, buy, soc, pv_kw, solar_tag,
-        sell_threshold, night_reserve, night_target, discharge_kw, t, b,
+        sell_threshold, night_reserve, discharge_kw, t, b,
+        solar: Optional[SolarForecast] = None,
     ) -> Decision:
         cheap_buy = t["night_cheap_buy"]
+        # Dynamic night target: charge more if tomorrow is cloudy, less if sunny
+        night_target = self._dynamic_night_target(solar, b)
 
         # 1. Below floor — stop all discharge, let grid cover home
         if soc <= night_reserve:
@@ -185,11 +227,13 @@ class ArbitrageStrategy:
                     discharge_power_kw=discharge_kw,
                 )
 
-        # 3. Cheap top-up to ensure morning reserve
+        # 3. Cheap top-up — target adjusted for tomorrow's solar forecast
         if buy <= cheap_buy and soc < night_target:
+            solar_hint = f" (cloudy tomorrow)" if solar and solar.is_cloudy else (
+                         f" (sunny tomorrow)" if solar and solar.is_sunny else "")
             return Decision(
                 action=ACTION_FORCE_CHARGE,
-                reason=f"Night cheap charge ${buy:.4f}/kWh → target {night_target}%{solar_tag}",
+                reason=f"Night cheap charge ${buy:.4f}/kWh → target {night_target}%{solar_hint}{solar_tag}",
                 sell_price=sell, buy_price=buy, soc=soc, pv_kw=pv_kw,
             )
 
@@ -201,6 +245,47 @@ class ArbitrageStrategy:
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _solar_will_saturate(self, soc: float, pv_kw: float, sched: dict, b: dict) -> bool:
+        """Return True if remaining solar output today will likely fill the battery."""
+        if pv_kw < 0.5:
+            return False  # not generating meaningfully
+        capacity_kwh = b.get("capacity_kwh", 37.7)
+        max_soc = b.get("max_soc", 95)
+        remaining_kwh = (max_soc - soc) / 100 * capacity_kwh
+
+        now = datetime.now()
+        sunset_hour = sched.get("sunset_hour", 19)
+        hours_left = max(0.0, sunset_hour - now.hour - now.minute / 60)
+        estimated_kwh = pv_kw * hours_left * 0.7  # 0.7 = efficiency/self-consumption factor
+
+        threshold = b.get("solar_saturation_threshold", 0.8)
+        return estimated_kwh >= remaining_kwh * threshold
+
+    def _charge_target_soc(self, solar: Optional[SolarForecast], b: dict) -> int:
+        """Adjust grid-charge target SOC based on tomorrow's solar forecast."""
+        base = b.get("max_soc", 95)
+        if solar is None:
+            return base
+        if solar.is_sunny:
+            return max(50, base - 20)   # sunny tomorrow: don't overfill, solar will top up
+        if solar.is_cloudy:
+            return base                  # cloudy: charge fully, solar won't help much
+        return base - 10                 # partly cloudy: middle ground
+
+    def _dynamic_night_target(self, solar: Optional[SolarForecast], b: dict) -> int:
+        """Night charge target SOC adjusted for tomorrow's solar generation forecast."""
+        base = b["night_target_soc"]  # default 30%
+        if solar is None:
+            return base
+        # Tomorrow sunny (>20 kWh): solar will fill battery — stay conservative
+        if solar.estimated_kwh > 20:
+            return base
+        # Tomorrow cloudy (<10 kWh): charge more now as solar won't compensate
+        if solar.estimated_kwh < 10:
+            return min(80, base + 20)
+        # Partly cloudy: modest top-up
+        return min(60, base + 10)
 
     def _is_night(self, now: datetime, sched: dict) -> bool:
         night_start = time.fromisoformat(sched["night_start"])

@@ -30,6 +30,7 @@ app = FastAPI(title="Fox-Amber Dashboard")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
 _state = StateStore()
+_insights = None   # set by main.py after log analysis
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
@@ -182,6 +183,38 @@ async def get_defaults(_: Annotated[str, Depends(_current_user)]):
     return _DEFAULT_CONFIG
 
 
+@app.get("/api/insights")
+async def get_insights(_: Annotated[str, Depends(_current_user)]):
+    if _insights is None:
+        return {"available": False}
+    p = _insights.price
+    l = _insights.load
+    return {
+        "available": True,
+        "generated_at": _insights.generated_at.isoformat(),
+        "price": {
+            "n_samples": p.n_samples,
+            "buy_p10": p.buy_p10,
+            "buy_p25": p.buy_p25,
+            "buy_p50": p.buy_p50,
+            "buy_p75": p.buy_p75,
+            "sell_p75": p.sell_p75,
+            "sell_p90": p.sell_p90,
+            "suggested_buy_threshold": p.suggested_buy_threshold(),
+            "suggested_sell_threshold": p.suggested_sell_threshold(),
+            "cheap_hours": p.cheap_hours(),
+            "hourly_buy": p.hourly_buy,
+        },
+        "load": {
+            "n_samples": l.n_samples,
+            "avg_load_kw": l.avg_load,
+            "peak_load_kw": l.peak_load,
+            "high_load_hours": l.high_load_hours(),
+            "hourly_avg_kw": l.hourly_avg,
+        },
+    }
+
+
 # ── Cached Fox client (avoids SN rediscovery per request) ────────────────────
 
 _fox_client = None
@@ -275,20 +308,3 @@ if DIST.exists():
         return FileResponse(str(DIST / "index.html"))
 
 
-# ── Background polling thread ─────────────────────────────────────────────────
-
-def _start_polling():
-    _state.load_history_from_log("monitor.log")
-    cfg = yaml.safe_load(CONFIG_PATH.read_text())
-    from main import run
-    t = threading.Thread(
-        target=run, args=(cfg,),
-        kwargs={"state": _state, "config_path": str(CONFIG_PATH)},
-        daemon=True,
-    )
-    t.start()
-
-
-@app.on_event("startup")
-async def startup():
-    _start_polling()

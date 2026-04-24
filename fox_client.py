@@ -129,14 +129,20 @@ class FoxClient:
         else:
             datas = result.get("datas", [])
         data = {item["variable"]: item.get("value", 0) for item in datas}
+        pv   = float(data.get("pvPower", 0))
+        grid = float(data.get("meterPower", 0))
+        load = float(data.get("loadsPower", 0))
+        # batPower often absent from API; derive from power balance (positive = charging)
+        bat_power = float(data["batPower"]) if "batPower" in data else round(pv + grid - load, 3)
+        work_mode = str(data["workMode"]) if "workMode" in data else (self._last_mode or "Unknown")
         return InverterStatus(
-            work_mode=str(data.get("workMode", "Unknown")),
-            pv_power_kw=float(data.get("pvPower", 0)),
-            grid_power_kw=float(data.get("meterPower", 0)),
-            load_power_kw=float(data.get("loadsPower", 0)),
+            work_mode=work_mode,
+            pv_power_kw=pv,
+            grid_power_kw=grid,
+            load_power_kw=load,
             battery=BatteryStatus(
                 soc=float(data.get("SoC", 0)),
-                power_kw=float(data.get("batPower", 0)),
+                power_kw=bat_power,
                 temperature=float(data.get("batTemperature", 0)),
                 voltage=float(data.get("batVoltage", 0)),
             ),
@@ -188,10 +194,11 @@ class FoxClient:
             min_soc_on_grid=min_soc,
         )
 
-    def force_charge(self, target_soc: int = 95) -> None:
-        """Force charge from grid up to target_soc %. Inverter controls charge rate."""
+    def force_charge(self, target_soc: int = 95, charge_power_kw: float = 5.0) -> None:
+        """Force charge from grid up to target_soc % at charge_power_kw."""
         self._set_scheduler(
             MODE_FORCE_CHARGE,
+            fd_pwr_w=int(charge_power_kw * 1000),
             fd_soc=target_soc,
             min_soc_on_grid=10,
         )

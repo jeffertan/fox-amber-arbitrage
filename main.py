@@ -11,7 +11,9 @@ import argparse
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import yaml
 from datetime import datetime, timedelta
@@ -90,11 +92,23 @@ def _apply_decision(fox, decision, config: dict, dry_run: bool) -> None:
     if dry_run:
         log.info(f"[DRY RUN] {decision}")
         return
-    night_reserve = config["battery"]["night_reserve_soc"]
+    b = config["battery"]
+    from datetime import datetime
+    from strategy import ArbitrageStrategy
+    now = datetime.now()
+    sched = config["schedule"]
+    from datetime import time as _time
+    night_start = _time.fromisoformat(sched["night_start"])
+    day_start = _time.fromisoformat(sched["day_start"])
+    t = now.time()
+    is_night = t >= night_start or t < day_start
+    discharge_reserve = b["night_reserve_soc"] if is_night else b.get("day_discharge_reserve_soc", 45)
     if decision.action == ACTION_FORCE_DISCHARGE:
-        fox.force_discharge(decision.discharge_power_kw, min_soc=night_reserve)
+        fox.force_discharge(decision.discharge_power_kw, min_soc=discharge_reserve)
     elif decision.action == ACTION_FORCE_CHARGE:
-        fox.force_charge()
+        target = decision.charge_target_soc or config["battery"].get("max_soc", 95)
+        charge_kw = config["battery"].get("max_charge_kw", 5.0)
+        fox.force_charge(target_soc=target, charge_power_kw=charge_kw)
     else:
         fox.self_use()
 
@@ -137,6 +151,7 @@ def run(config: dict, dry_run: bool = False, state=None, config_path: str = "con
     was_sell_notify = False
     last_sell = None
     last_action = None
+    in_error = False  # 连续错误状态，避免刷屏
     last_daily_summary: str = ""
     last_action_start: datetime | None = None
     last_action_price_kwh: float = 0.0
@@ -163,6 +178,10 @@ def run(config: dict, dry_run: bool = False, state=None, config_path: str = "con
             sell = prices.sell.price_kwh
             buy = prices.buy.price_kwh
             is_spike = prices.sell.is_spike
+            # 网络恢复通知
+            if in_error and not dry_run:
+                notifier.recovered()
+            in_error = False
 
             log.info(prices.summary())
             if state:
@@ -268,8 +287,9 @@ def run(config: dict, dry_run: bool = False, state=None, config_path: str = "con
 
         except Exception as e:
             log.error(f"错误: {e}", exc_info=True)
-            if not dry_run:
+            if not dry_run and not in_error:
                 notifier.error(str(e))
+            in_error = True
 
         elapsed = time.monotonic() - loop_start
         time.sleep(max(0, poll_sec - elapsed))
@@ -295,7 +315,57 @@ def main():
         status_report(AmberClient(os.getenv("AMBER_API_KEY", "")), fox)
         return
 
-    run(config, dry_run=args.dry_run)
+    # Single-instance lock: exit immediately if another monitor is already running
+    pid_file = "/tmp/amber-monitor.pid"
+    try:
+        with open(pid_file) as f:
+            old_pid = int(f.read().strip())
+        os.kill(old_pid, 0)  # check if process exists
+        log.warning(f"Another instance (PID {old_pid}) is running — exiting")
+        raise SystemExit(0)
+    except (FileNotFoundError, ValueError, ProcessLookupError):
+        pass  # no running instance, proceed
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    from state import StateStore
+    import api as api_module
+    shared_state = StateStore()
+    shared_state.load_history_from_log(LOG_PATH)
+    api_module._state = shared_state
+
+    # Analyse historical prices and load patterns
+    from log_analysis import analyse as _analyse
+    insights = _analyse(LOG_PATH, days=7)
+    if insights:
+        log.info(insights.summary())
+        api_module._insights = insights
+
+    def _start_api():
+        import uvicorn
+        uvicorn.run(
+            api_module.app, host="0.0.0.0", port=8000,
+            log_config={"version": 1, "disable_existing_loggers": False},
+        )
+
+    t = threading.Thread(target=_start_api, daemon=True)
+    t.start()
+    import time as _t; _t.sleep(1)  # let uvicorn init
+    root_logger = logging.getLogger()
+    root_logger.handlers = root_logger.handlers[:1]  # keep only our handler
+    log.info("Dashboard API started on http://0.0.0.0:8000")
+
+    try:
+        run(config, dry_run=args.dry_run, state=shared_state, config_path=args.config)
+    finally:
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
